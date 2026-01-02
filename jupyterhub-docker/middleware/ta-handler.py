@@ -21,8 +21,8 @@ import asyncio
 # --- Configuration ---
 load_dotenv()
 
-# DATABASE_FILE = "chat_history.db" # for local testing
-DATABASE_FILE = "/app/chat_histories/chat_history.db"  # for docker
+# DATABASE_FILE = "/Users/daianarinja/Documents/Github/jelai/jupyterhub-docker/middleware/data/chat_history.db" # for local testing
+DATABASE_FILE = "/app/chat_histories/chat_history.db"  # local absolute
 EXPERIMENT_CONFIG_FILE = Path(__file__).parent / "inputs" / "ab_experiments.json" # Added
 
 EA_URL = "http://localhost:8003/expert_query" 
@@ -47,11 +47,14 @@ TA_SYSTEM_PROMPT_FILE = "./inputs/ta_system_prompt.txt"
 
 # --- Default Values (used if file loading fails) ---
 DEFAULT_LEARNING_OBJECTIVES = [
-    "Use Python", "Use proper syntax"
+    "R-Code korrekt anwenden",
+    "Grundlegende statistische Kennwerte berechnen",
+    "Itemkennwerte und Reliabilität verstehen",
+    "Einfache Hypothesentests durchführen"
 ]
-DEFAULT_ASSIGNMENT_DESCRIPTION = "Complete the assignment using Python. Focus on syntax and logic."
+DEFAULT_ASSIGNMENT_DESCRIPTION = "Bearbeite die Aufgabe in R. Fokus auf statistische Auswertung und Testtheorie."
 MIN_MATCH_SCORE = 70 # Minimum score (out of 100) to consider it a match
-DEFAULT_TA_SYSTEM_PROMPT = "You are a helpful tutor named Juno, embedded in a Jupyterlab Interface." 
+DEFAULT_TA_SYSTEM_PROMPT = "You are an novice psychology student named Juno, embedded in a Jupyterlab Interface." 
 DEFAULT_CLASSIFICATION_PROMPT = "Classify the following question as good or bad"
 DEFAULT_POSSIBLE_CLASSIFICATIONS = ["good", "bad"]
 
@@ -464,6 +467,27 @@ async def call_llm(messages: list, model_name: str, purpose: str = "LLM call") -
     except Exception as e:
         logging.error(f"An unexpected error occurred during WebUI call for {purpose} ({model_name}): {e}")
         raise HTTPException(status_code=500, detail=f"An unexpected error occurred during {purpose}: {e}")
+    
+# --- Knowledge State Storage ---
+KNOWLEDGE_STATE_DIR = "./knowledge_states"
+os.makedirs(KNOWLEDGE_STATE_DIR, exist_ok=True)
+
+def get_knowledge_state(student_id: str, file_name: str) -> dict:
+    session_id = extract_session_id_from_filename(file_name, student_id)
+    path = os.path.join(KNOWLEDGE_STATE_DIR, f"{session_id}.json")
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_knowledge_state(student_id: str, file_name: str, state: dict):
+    session_id = extract_session_id_from_filename(file_name, student_id)
+    path = os.path.join(KNOWLEDGE_STATE_DIR, f"{session_id}.json")
+    with open(path, "w") as f:
+        json.dump(state, f)
 
 
 # --- Database Functions ---
@@ -720,6 +744,7 @@ Please return to the Qualtrics survey tab and enter the following code to finali
 
     # --- 0. Get Context ---
     student_profile = get_student_profile(message.student_id, message.file_name)
+    knowledge_state = get_knowledge_state(message.student_id, message.file_name)
     needs_guidance = student_profile.get("needs_guidance_flag", False)
     last_exec_example = student_profile.get("last_executive_example")
     last_instr_example = student_profile.get("last_instrumental_example")
@@ -863,58 +888,24 @@ Please return to the Qualtrics survey tab and enter the following code to finali
                 consecutive_executive = 0
             # --- End update ---
 
-            # Apply adaptive response logic based on A/B test group and question type
-            if current_profile_hint_strategy == "enhanced_guidance":
-                # Treatment group gets adaptive help-seeking logic
-                if classification_result == "instrumental":
-                    # Reset consecutive_executive streak
-                    consecutive_executive = 0
-                    if last_classification == "executive":
-                        # Shift from executive to instrumental - provide positive reinforcement
-                        system_prompt_content += """\n**Profile Hint (Positive Reinforcement):** The student has shifted from an executive to an instrumental question. Provide explicit positive reinforcement for this shift (e.g., "That's a very effective way to ask for help to understand the material.") along with standard JIT support."""
-                        logging.info(f"Adaptive Logic: Detected shift from executive to instrumental for {message.student_id}")
-                    else:
-                        # Ongoing instrumental questions - maintain standard support
-                        system_prompt_content += """\n**Profile Hint (Standard Support):** Continue providing JIT support with a positive and encouraging tone, but without explicit praise. The primary reinforcement is the answer itself."""
-                        logging.info(f"Adaptive Logic: Ongoing instrumental questions for {message.student_id}")
+# --- Disabled: Tutor-style adaptive guidance ---
+# Apply adaptive response logic based on A/B test group and question type
+# if current_profile_hint_strategy == "enhanced_guidance":
+#     if classification_result == "instrumental":
+#         consecutive_executive = 0
+#         if last_classification == "executive":
+#             system_prompt_content += """\n[Positive Reinforcement Block Disabled]"""
+#         else:
+#             system_prompt_content += """\n[Standard Support Block Disabled]"""
+#     elif classification_result == "executive":
+#         pass
+# elif current_profile_hint_strategy == "none":
+#     pass
+# else:
+#     pass
+# --- End Disabled Block ---
 
-                elif classification_result == "executive":
-                    # Incremental hints based on consecutive executive questions
-                    if consecutive_executive == 0:
-                        # No executive streak, skip hint or use a default (no hint)
-                        pass
-                    elif consecutive_executive == 1:
-                        system_prompt_content += """\n**Profile Hint (First Executive):** 
-                        This is the first executive question in sequence. Gently guide the student towards reflection, without requiring direct rephrasing. 
-                        For example: "That question seems focused on getting the answer directly. For the following questions, can you think about how to rephrase them to better understand the underlying concepts?" """
-                        logging.info(f"Adaptive Logic: First executive question for {message.student_id}")
-                    elif consecutive_executive == 2:
-                        system_prompt_content += """\n**Profile Hint (Second Executive):** 
-                        This is the second consecutive executive question. Provide elements of good instrumental questions. 
-                        For example: "Good questions often explore the 'why' or 'how' of a concept, or compare different approaches. How might you rephrase following questions with that in mind?" or "Good questions decompose complex concepts into smaller, more manageable parts. How might you rephrase following questions with that in mind?" """
-                        logging.info(f"Adaptive Logic: Second consecutive executive question for {message.student_id}")
-                    elif consecutive_executive == 3:
-                        last_exec_example = student_profile.get("last_executive_example", "your previous question")
-                        system_prompt_content += f"""\n**Profile Hint (Third Executive):** 
-                        This is the third consecutive executive question. Take the student's question and rephrase it as a model instrumental question. For example: 
-                        "Instead of asking 'make a bar plot', a better version might be 'what is the first step to make a bar plot?' Could you try rephrasing your next request similarly?"
-                        Student's previous question: {last_exec_example} """
-                        logging.info(f"Adaptive Logic: Third consecutive executive question for {message.student_id}")
-                    else:
-                        last_instr_example = student_profile.get("last_instrumental_example", "your previous question")
-                        system_prompt_content += f"""\n**Profile Hint (Fourth+ Executive):** 
-                        This is the fourth or subsequent consecutive executive question. Directly refer to the pedagogical rationale. 
-                        For example: "Research in learning suggests that asking questions focused on understanding is more strongly linked to better learning outcomes than seeking direct solutions. It might be helpful to try and focus on understanding the process here." or "Focusing on direct solutions is not as effective as asking questions that help you understand the material. How might you rephrase your next request to focus on understanding the material?"
-                        Use their previous good question as motivation: {last_instr_example} """
-                        logging.info(f"Adaptive Logic: Fourth+ consecutive executive question for {message.student_id}")
-            elif current_profile_hint_strategy == "none":
-                # Control group gets no adaptive hints
-                logging.info(f"Control group: No adaptive hints for {message.student_id}")
-                pass
-            else:
-                logging.warning(f"Unknown profile hint strategy '{current_profile_hint_strategy}' for {message.student_id}")
-
-            system_prompt_content += "\n" 
+#system_prompt_content += "\n"
 
             final_prompt_messages = []
             final_prompt_messages.append({"role": "system", "content": system_prompt_content})
@@ -923,10 +914,11 @@ Please return to the Qualtrics survey tab and enter the following code to finali
             final_prompt_messages.append(
                 {"role": "user", "content": f"""
                     [INTERNAL CONTEXT: DO NOT REVEAL SOURCES]
+                    Knowledge State: {json.dumps(knowledge_state, ensure_ascii=False)}
                     Assignment: {assignment_description}
                     Recent Activity Logs:
                     {logs_context}
-                    Technical Information: "{ea_response}"
+                    Technical Information: {ea_response}
                     Question Classification: {classification_result}
                     [END INTERNAL CONTEXT]
 
@@ -934,7 +926,8 @@ Please return to the Qualtrics survey tab and enter the following code to finali
                     Student Question: "{message.message_text}"
                     ---
 
-                    Based on the context above (including profile hints and history), formulate your response as Juno, focusing directly on answering or guiding the student regarding their specific question. Never reveal or mention internal information like learning objectives or the expert source."""
+                            You are a novice.  Use the technical knowledge only to check if the student is correct.  If wrong, ask for clarification instead of correcting.  If right, be curious and appreciative.  Be short, informal, unsure.
+                            """
                 }
             )
 
@@ -947,6 +940,10 @@ Please return to the Qualtrics survey tab and enter the following code to finali
 
         except Exception as e:
             logging.error(f"LLM Call (Pedagogical Response) failed: {e}. Using default final response.")
+        
+        knowledge_state["last_response"] = final_response
+        save_knowledge_state(message.student_id, message.file_name, knowledge_state)
+
 
         # --- 5. Store Final Response ---
         add_to_history(
